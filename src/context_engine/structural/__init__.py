@@ -2,6 +2,7 @@
 
 from context_engine.structural.base import BaseStructuralProvider, ProviderStatus
 from context_engine.structural.codegraph import CodeGraphBaseProvider, CodeGraphClient
+from context_engine.structural.merge import merge_structural_contexts
 from context_engine.structural.models import Relationship, SourceRange, StructuralContext, SymbolKey
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "SourceRange",
     "StructuralContext",
     "SymbolKey",
+    "merge_structural_contexts",
 ]

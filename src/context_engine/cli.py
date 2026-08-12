@@ -1282,6 +1282,51 @@ def status(ctx: click.Context, output_json: bool, oneline: bool) -> None:
     animate(lines)
 
 
+@main.command()
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def doctor(ctx: click.Context, output_json: bool) -> None:
+    """Show worktree-aware repository diagnostics."""
+    from context_engine.git.doctor import worktree_doctor_report
+
+    config = ctx.obj["config"]
+    report = worktree_doctor_report(config, _safe_cwd())
+
+    if output_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    if not report.get("git", {}).get("available"):
+        click.echo("Git: unavailable")
+        return
+
+    repo = report["repository"]
+    worktree = report["worktree"]
+    storage = report["storage"]
+    overlay = report["overlay"]
+    click.echo(
+        "\n".join(
+            [
+                "Repository",
+                f"  Common git dir: {repo['common_dir']}",
+                f"  Repository ID: {repo['id']}",
+                "Worktree",
+                f"  Root: {worktree['root']}",
+                f"  Worktree ID: {worktree['id']}",
+                f"  HEAD: {worktree['head_sha']}",
+                f"  Base: {worktree['base_sha']}",
+                "Storage",
+                f"  Shared base: {storage['base_dir']}",
+                f"  Overlay: {storage['worktree_dir']}",
+                "Overlay",
+                f"  Modified: {overlay['modified_count']}",
+                f"  Added: {overlay['added_count']}",
+                f"  Deleted: {overlay['deleted_count']}",
+            ]
+        )
+    )
+
+
 @main.command("list")
 def list_commands() -> None:
     """Show all available CCE commands with usage examples."""

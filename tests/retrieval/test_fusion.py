@@ -90,9 +90,38 @@ def test_fusion_respects_hard_token_budget_and_counts_omitted_chunks():
     assert result.omitted == 1
 
 
+def test_fusion_summary_level_applies_default_budget():
+    result = fuse_retrieval_context(
+        RetrievalFusionInput(overlay_chunks=[chunk("large", "a.py", "x" * 6000)]),
+        level="summary",
+    )
+
+    assert result.chunks == []
+    assert result.omitted == 1
+
+
 def test_fusion_preserves_structural_context():
     structural = StructuralContext(sources=[SourceRange("a.py", 1, 2)], provider="test")
 
     result = fuse_retrieval_context(RetrievalFusionInput(structural=structural))
 
+    assert result.structural is structural
+
+
+def test_fusion_counts_structural_context_against_token_budget():
+    structural = StructuralContext(
+        sources=[SourceRange("a.py", 1, 2, content="x" * 40)],
+        provider="test",
+    )
+
+    result = fuse_retrieval_context(
+        RetrievalFusionInput(
+            overlay_chunks=[chunk("semantic", "semantic.py", "short")],
+            structural=structural,
+        ),
+        max_tokens=10,
+    )
+
+    assert result.chunks == []
+    assert result.omitted == 1
     assert result.structural is structural

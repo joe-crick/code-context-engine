@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from context_engine.git.diff import GitWorktreeDiff
 from context_engine.models import Chunk
+from context_engine.retrieval.budgeting import DisclosureLevel, resolve_context_budget
 from context_engine.structural.models import StructuralContext
 
 
@@ -27,11 +28,16 @@ class FusedRetrievalContext:
 def fuse_retrieval_context(
     data: RetrievalFusionInput,
     *,
+    level: DisclosureLevel = "standard",
     max_tokens: int | None = None,
 ) -> FusedRetrievalContext:
     """Merge semantic overlay/base chunks and keep hard token budget."""
     chunks = _merged_chunks(data.base_chunks, data.overlay_chunks, data.diff)
-    packed, omitted = _pack_chunks(chunks, max_tokens)
+    budget = resolve_context_budget(level=level, max_tokens=max_tokens)
+    packed, omitted = _pack_chunks(
+        chunks,
+        max(0, budget - _structural_token_count(data.structural)),
+    )
     return FusedRetrievalContext(chunks=packed, structural=data.structural, omitted=omitted)
 
 
@@ -73,3 +79,14 @@ def _chunk_rank_key(chunk: Chunk) -> tuple[float, float, str]:
     if isinstance(distance, int | float):
         return (0.0, float(distance), chunk.id)
     return (1.0, -chunk.confidence_score, chunk.id)
+
+
+def _structural_token_count(structural: StructuralContext) -> int:
+    text_parts: list[str] = []
+    text_parts.extend(source.content or source.path for source in structural.sources)
+    text_parts.extend(
+        f"{relationship.source.qualified_name} {relationship.kind} {relationship.target.qualified_name}"
+        for relationship in structural.relationships
+    )
+    text_parts.extend(symbol.qualified_name for symbol in structural.impact)
+    return max(0, int(sum(len(part) for part in text_parts) / 3.3))

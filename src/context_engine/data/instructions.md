@@ -10,6 +10,11 @@ the codebase, answering questions about code, or understanding how things
 work. `context_search` returns the most relevant code chunks with
 confidence scores instead of whole files.
 
+When configured with CodeGraph, `context_search` may combine a shared
+repository base with the current Git worktree overlay. Prefer its returned
+worktree-aware sources; read files directly only when exact source is needed
+before editing.
+
 When to use `context_search`:
 - Answering questions about the codebase ("how does X work?", "where is Y?")
 - Exploring structure or architecture

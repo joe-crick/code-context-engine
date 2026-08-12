@@ -130,9 +130,11 @@ def _source_from_query_row(row: dict[str, Any]) -> SourceRange:
 
 
 def _symbol_from_impact_row(row: dict[str, Any]) -> SymbolKey:
+    line = row.get("startLine") or row.get("start_line")
     return SymbolKey(
         qualified_name=str(row.get("name") or ""),
         kind=row.get("kind"),
         path=row.get("filePath") or row.get("file_path"),
         signature=row.get("signature"),
+        line=int(line) if line is not None else None,
     )

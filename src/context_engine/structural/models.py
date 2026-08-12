@@ -12,6 +12,7 @@ class SymbolKey:
     kind: str | None
     path: str | None = None
     signature: str | None = None
+    line: int | None = None
 
 
 @dataclass(frozen=True)

@@ -1327,6 +1327,34 @@ def doctor(ctx: click.Context, output_json: bool) -> None:
     )
 
 
+@main.command(name="worktree-benchmark")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+def worktree_benchmark(output_json: bool) -> None:
+    """Measure worktree overlay discovery cost."""
+    from context_engine.git.benchmark import benchmark_worktree_overlay
+
+    result = benchmark_worktree_overlay(_safe_cwd())
+    if result is None:
+        raise click.ClickException("Not inside a Git worktree")
+    data = result.to_dict()
+    if output_json:
+        click.echo(json.dumps(data, indent=2))
+        return
+    click.echo(
+        "\n".join(
+            [
+                "Worktree Overlay Benchmark",
+                f"  Changed files: {data['changed_file_count']}",
+                f"  Modified: {data['modified_count']}",
+                f"  Added: {data['added_count']}",
+                f"  Deleted: {data['deleted_count']}",
+                f"  Renamed: {data['renamed_count']}",
+                f"  Elapsed: {data['elapsed_ms']:.2f} ms",
+            ]
+        )
+    )
+
+
 @main.command("list")
 def list_commands() -> None:
     """Show all available CCE commands with usage examples."""
@@ -3424,6 +3452,7 @@ async def _run_index(
     """Run indexing pipeline (thin wrapper over `indexer.pipeline.run_indexing`)."""
     from context_engine.indexer.pipeline import run_indexing
 
+    storage_base = _runtime_storage_base(config, Path(project_dir))
     log_fn = (lambda msg: click.echo(msg)) if verbose else None
     from context_engine.cli_style import warn, dim, CHECK, CROSS
 
@@ -3476,6 +3505,7 @@ async def _run_index(
 
     result = await run_indexing(
         config, project_dir, full=full, target_path=target_path,
+        storage_base_override=storage_base,
         log_fn=log_fn, progress_fn=progress_fn,
         embed_progress_fn=embed_progress_fn, phase_fn=phase_fn,
     )
@@ -3506,7 +3536,7 @@ async def _run_index(
     )
 
     # Update full_file_tokens baseline so cce savings shows codebase size
-    _storage_dir = project_storage_dir(config, Path(project_dir))
+    _storage_dir = storage_base
     stats_path = _storage_dir / "stats.json"
     try:
         stats = json.loads(stats_path.read_text(encoding="utf-8")) if stats_path.exists() else {}
@@ -3526,6 +3556,58 @@ async def _run_index(
     stats["full_file_tokens"] = total_tokens
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text(json.dumps(stats), encoding="utf-8")
+
+
+def _runtime_storage_base(config, project_dir: Path) -> Path:
+    from context_engine.git import (
+        repository_storage_layout,
+        resolve_git_repository_context,
+    )
+
+    context = resolve_git_repository_context(project_dir)
+    if context is None:
+        return project_storage_dir(config, project_dir)
+
+    layout = repository_storage_layout(config, project_dir, context)
+    return layout.base_dir
+
+
+def _runtime_storage_backend(config, project_dir: Path):
+    from context_engine.git import (
+        get_worktree_diff,
+        repository_storage_layout,
+        resolve_git_repository_context,
+    )
+    from context_engine.storage.local_backend import LocalBackend
+    from context_engine.storage.worktree_overlay import WorktreeOverlayBackend
+
+    context = resolve_git_repository_context(project_dir)
+    if context is None:
+        storage_base = project_storage_dir(config, project_dir)
+        return storage_base, LocalBackend(base_path=str(storage_base)), None
+
+    layout = repository_storage_layout(config, project_dir, context)
+    diff = get_worktree_diff(
+        context.worktree_root,
+        base_sha=context.base_sha,
+        head_sha=context.head_sha,
+    )
+    backend = WorktreeOverlayBackend(
+        base=LocalBackend(base_path=str(layout.base_dir)),
+        overlay=LocalBackend(base_path=str(layout.worktree_dir)),
+        diff=diff,
+    )
+
+    def refresh_diff() -> None:
+        backend.update_diff(
+            get_worktree_diff(
+                context.worktree_root,
+                base_sha=context.base_sha,
+                head_sha=context.head_sha,
+            )
+        )
+
+    return layout.worktree_dir, backend, refresh_diff
 
 
 async def _run_serve(config) -> None:
@@ -3549,7 +3631,6 @@ async def _run_serve(config) -> None:
     )
     cap_ort_threads(max_threads=getattr(config, "serve_max_ort_threads", None))
 
-    from context_engine.storage.local_backend import LocalBackend
     from context_engine.indexer.embedder import Embedder
     from context_engine.retrieval.retriever import HybridRetriever
     from context_engine.compression.compressor import Compressor
@@ -3561,8 +3642,7 @@ async def _run_serve(config) -> None:
 
     project_dir = str(_safe_cwd())
     project_name = _safe_cwd().name
-    storage_base = project_storage_dir(config, _safe_cwd())
-    backend = LocalBackend(base_path=str(storage_base))
+    storage_base, backend, refresh_diff = _runtime_storage_backend(config, _safe_cwd())
     embedder = Embedder(model_name=config.embedding_model)
     retriever = HybridRetriever(backend=backend, embedder=embedder)
     compressor = Compressor(
@@ -3572,7 +3652,7 @@ async def _run_serve(config) -> None:
     )
     mcp = ContextEngineMCP(
         retriever=retriever, backend=backend, compressor=compressor,
-        embedder=embedder, config=config,
+        embedder=embedder, config=config, index_storage_base=storage_base,
     )
 
     # Idle tracker — shuts down the server after prolonged inactivity (#139).
@@ -3584,8 +3664,27 @@ async def _run_serve(config) -> None:
     # all indexing the same project simultaneously (#139).
     index_lock = ProjectIndexLock(storage_base)
 
-    chunk_count = backend._vector_store.count()
+    count_chunks = getattr(backend, "count_chunks", None)
+    chunk_count = (
+        count_chunks()
+        if count_chunks is not None
+        else backend._vector_store.count()
+    )
     import sys
+
+    needs_overlay_index = getattr(backend, "needs_overlay_index", None)
+    if needs_overlay_index is not None and needs_overlay_index():
+        try:
+            await run_indexing(
+                config,
+                project_dir,
+                full=False,
+                storage_base_override=storage_base,
+            )
+            if refresh_diff is not None:
+                refresh_diff()
+        except Exception as exc:
+            _log.warning("Startup worktree overlay indexing failed: %s", exc)
 
     watcher = None
     worker_task = None
@@ -3644,7 +3743,14 @@ async def _run_serve(config) -> None:
                         await _reindex_queue.put(rel)
                     continue
                 try:
-                    await run_indexing(config, project_dir, target_path=rel)
+                    await run_indexing(
+                        config,
+                        project_dir,
+                        target_path=rel,
+                        storage_base_override=storage_base,
+                    )
+                    if refresh_diff is not None:
+                        refresh_diff()
                     _log.debug("Re-indexed: %s", rel)
                 except Exception as exc:
                     _log.warning("Watch re-index failed for %s: %s", rel, exc)

@@ -110,6 +110,12 @@ class WorktreeOverlayBackend:
             return 0
         return _count_chunks(self._base) + overlay_count
 
+    def needs_overlay_index(self) -> bool:
+        return (
+            bool(self._diff.added | self._diff.modified)
+            and _count_chunks(self._overlay) == 0
+        )
+
     async def delete_by_file(self, file_path: str) -> None:
         await self._overlay.delete_by_file(file_path)
 

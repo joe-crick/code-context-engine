@@ -15,6 +15,11 @@ repository base with the current Git worktree overlay. Prefer its returned
 worktree-aware sources; read files directly only when exact source is needed
 before editing.
 
+If `structural.provider: codegraph` is enabled, `context_search` may include
+structural sources, relationships, and impact items after the semantic chunks.
+Treat file/line references in that section as provenance, and prefer worktree
+overlay entries over base CodeGraph entries.
+
 When to use `context_search`:
 - Answering questions about the codebase ("how does X work?", "where is Y?")
 - Exploring structure or architecture

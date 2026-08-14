@@ -83,6 +83,13 @@ class Manifest:
         """
         self._entries = {}
 
+    @property
+    def entries(self) -> dict[str, str]:
+        return dict(self._entries)
+
+    def replace_entries(self, entries: dict[str, str]) -> None:
+        self._entries = dict(entries)
+
     def get_hash(self, file_path: str) -> str | None:
         return self._entries.get(file_path)
 

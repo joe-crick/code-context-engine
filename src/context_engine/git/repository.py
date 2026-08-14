@@ -50,6 +50,17 @@ def resolve_git_repository_context(
     )
 
 
+def resolve_repository_main_checkout(project_dir: Path) -> Path | None:
+    """Return the primary checkout path for a repository, or None if unavailable."""
+    context = resolve_git_repository_context(project_dir)
+    if context is None:
+        return None
+    checkout = context.git_common_dir.parent
+    if resolve_git_repository_context(checkout) is None:
+        return None
+    return checkout
+
+
 def resolve_base_sha(
     worktree_root: Path,
     *,

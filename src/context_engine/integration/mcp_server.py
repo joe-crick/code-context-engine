@@ -1778,13 +1778,41 @@ class ContextEngineMCP:
 
         path = (args.get("path") or "").strip() or None
         try:
-            result = await run_indexing(
-                self._config,
-                self._project_dir,
-                full=False,
-                target_path=path,
-                storage_base_override=getattr(self, "_index_storage_base", None),
-            )
+            from context_engine.git import resolve_git_repository_context
+
+            git_context = resolve_git_repository_context(Path(self._project_dir))
+            if path is None and git_context is not None:
+                from context_engine.indexer.worktree import sync_worktree_overlay
+
+                result, diff, _ = await sync_worktree_overlay(
+                    self._config,
+                    self._project_dir,
+                )
+                update_diff = getattr(self._backend, "update_diff", None)
+                if update_diff is not None:
+                    update_diff(diff)
+            else:
+                result = await run_indexing(
+                    self._config,
+                    self._project_dir,
+                    full=False,
+                    target_path=path,
+                    storage_base_override=getattr(self, "_index_storage_base", None),
+                )
+                if git_context is not None:
+                    from context_engine.git import repository_storage_layout
+                    from context_engine.indexer.worktree import indexed_worktree_diff
+
+                    layout = repository_storage_layout(
+                        self._config,
+                        Path(self._project_dir),
+                        git_context,
+                        migrate_legacy=False,
+                    )
+                    diff = indexed_worktree_diff(layout, head_sha=git_context.head_sha)
+                    update_diff = getattr(self._backend, "update_diff", None)
+                    if diff is not None and update_diff is not None:
+                        update_diff(diff)
         except Exception as exc:
             log.exception("reindex failed")
             return [TextContent(type="text", text=f"✗ Re-index failed: {exc}")]

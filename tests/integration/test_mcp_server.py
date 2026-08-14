@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from context_engine.cli import _run_index, _runtime_storage_backend, _runtime_storage_base
+from context_engine.git import repository_storage_layout, resolve_git_repository_context
 from context_engine.git.diff import GitWorktreeDiff
 from context_engine.integration.mcp_server import ContextEngineMCP
 from context_engine.models import Chunk, ChunkType
@@ -368,20 +369,25 @@ async def test_run_index_uses_runtime_storage_base_for_git_repositories(tmp_path
     repo = init_repo(tmp_path / "repo")
     cfg = MagicMock()
     cfg.storage_path = str(tmp_path / "storage")
+    context = resolve_git_repository_context(repo)
+    assert context is not None
+    layout = repository_storage_layout(cfg, repo, context)
     expected_storage = _runtime_storage_base(cfg, repo)
-    indexing_kwargs: list[dict] = []
+    sync_calls: list[tuple] = []
 
-    async def fake_run_indexing(*args, **kwargs):
+    async def fake_sync(*args, **kwargs):
         from context_engine.indexer.pipeline import IndexResult
 
-        indexing_kwargs.append(kwargs)
-        return IndexResult()
+        sync_calls.append((args, kwargs))
+        return IndexResult(), GitWorktreeDiff(), layout
 
-    monkeypatch.setattr("context_engine.indexer.pipeline.run_indexing", fake_run_indexing)
+    monkeypatch.setattr("context_engine.indexer.worktree.sync_worktree_overlay", fake_sync)
 
     await _run_index(cfg, str(repo))
 
-    assert indexing_kwargs[0]["storage_base_override"] == expected_storage
+    assert expected_storage == layout.worktree_dir
+    assert expected_storage != layout.base_dir
+    assert sync_calls[0][0][1] == str(repo)
 
 
 @pytest.mark.asyncio
@@ -409,6 +415,32 @@ async def test_mcp_reindex_passes_runtime_storage_override(tmp_path, monkeypatch
 
     assert indexing_kwargs[0]["storage_base_override"] == expected_storage
     assert indexing_kwargs[0]["target_path"] == "base.py"
+
+
+@pytest.mark.asyncio
+async def test_mcp_project_reindex_syncs_worktree_delta(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    cfg = MagicMock()
+    cfg.storage_path = str(tmp_path / "storage")
+    context = resolve_git_repository_context(repo)
+    assert context is not None
+    layout = repository_storage_layout(cfg, repo, context, migrate_legacy=False)
+    diff = GitWorktreeDiff(modified={"base.py"})
+
+    async def fake_sync(config, project_dir, **kwargs):
+        from context_engine.indexer.pipeline import IndexResult
+
+        return IndexResult(indexed_files=["base.py"], total_chunks=1), diff, layout
+
+    monkeypatch.setattr("context_engine.indexer.worktree.sync_worktree_overlay", fake_sync)
+    server = _make_server(tmp_path)
+    server._config = cfg
+    server._project_dir = str(repo)
+    server._backend = MagicMock()
+
+    await server._handle_reindex({})
+
+    server._backend.update_diff.assert_called_once_with(diff)
 
 
 @pytest.mark.asyncio

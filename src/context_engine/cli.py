@@ -1114,6 +1114,108 @@ def index(ctx: click.Context, full: bool, path: str | None) -> None:
     asyncio.run(_run_index(config, project_dir, full=full, target_path=path, verbose=verbose))
 
 
+@main.command("index-base")
+@click.option(
+    "--project-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Main checkout or linked worktree to resolve the repository from.",
+)
+@click.pass_context
+def index_base(ctx: click.Context, project_dir: Path | None) -> None:
+    """Build or refresh the shared repository base index."""
+    from context_engine.git import (
+        repository_storage_layout,
+        resolve_git_repository_context,
+        resolve_repository_main_checkout,
+    )
+
+    start_dir = (project_dir or _safe_cwd()).resolve()
+    config = ctx.obj["config"]
+    if project_dir is not None:
+        project_config = start_dir / PROJECT_CONFIG_NAME
+        config = load_config(project_path=project_config if project_config.exists() else None)
+    main_checkout = resolve_repository_main_checkout(start_dir)
+    if main_checkout is None:
+        raise click.ClickException(f"not a Git repository with a main checkout: {start_dir}")
+    git_context = resolve_git_repository_context(main_checkout)
+    if git_context is None:
+        raise click.ClickException(f"could not resolve Git repository identity: {main_checkout}")
+    layout = repository_storage_layout(
+        config,
+        main_checkout,
+        git_context,
+        migrate_legacy=False,
+    )
+
+    click.echo(f"Repository: {main_checkout}")
+    click.echo(f"Repo ID:    {git_context.repository_id}")
+    click.echo(f"Base store: {layout.base_dir}")
+    click.echo("")
+    click.echo("Indexing shared base...")
+    import time
+    started = time.monotonic()
+    result = asyncio.run(_run_index(
+        config,
+        str(main_checkout),
+        full=True,
+        verbose=ctx.obj["verbose"],
+        storage_base_override=layout.base_dir,
+        progress_lines=True,
+    ))
+    elapsed = time.monotonic() - started
+    if result.errors:
+        message = (
+            f"Shared base indexing failed\n"
+            f"Repository: {main_checkout}\n"
+            f"Base store: {layout.base_dir}\n"
+            f"Error: {'; '.join(result.errors[:3])}"
+        )
+        raise click.ClickException(message)
+    click.echo("")
+    click.echo("Shared base index complete")
+    click.echo(f"Files:  {len(result.indexed_files)}")
+    click.echo(f"Chunks: {result.total_chunks}")
+    click.echo(f"Elapsed: {elapsed:.1f}s")
+    click.echo(f"Store:  {layout.base_dir}")
+
+
+@main.command("sync-worktree")
+@click.option(
+    "--project-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Worktree to synchronize with its shared repository base.",
+)
+@click.pass_context
+def sync_worktree(ctx: click.Context, project_dir: Path | None) -> None:
+    """Refresh only the semantic delta for a Git worktree."""
+    from context_engine.indexer.worktree import sync_worktree_overlay
+
+    worktree = (project_dir or _safe_cwd()).resolve()
+    config = ctx.obj["config"]
+    if project_dir is not None:
+        project_config = worktree / PROJECT_CONFIG_NAME
+        config = load_config(project_path=project_config if project_config.exists() else None)
+
+    click.echo(f"Worktree: {worktree}")
+    click.echo("Synchronizing worktree overlay...")
+    try:
+        result, diff, layout = asyncio.run(sync_worktree_overlay(config, worktree))
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result.errors:
+        raise click.ClickException("; ".join(result.errors[:3]))
+
+    click.echo("Worktree overlay complete")
+    click.echo(f"Modified: {len(diff.modified)}")
+    click.echo(f"Added:    {len(diff.added)}")
+    click.echo(f"Deleted:  {len(diff.deleted)}")
+    click.echo(f"Files indexed:  {len(result.indexed_files)}")
+    click.echo(f"Chunks indexed: {result.total_chunks}")
+    click.echo(f"Overlay: {layout.worktree_dir}")
+
+
 @main.command()
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.option("--oneline", is_flag=True, help="Single-line status for hooks")
@@ -1378,6 +1480,8 @@ def list_commands() -> None:
             ("cce index", "Re-index changed files"),
             ("cce index --full", "Force full re-index of every file"),
             ("cce index --path <file>", "Index one file or directory"),
+            ("cce index-base", "Build shared base index for worktrees"),
+            ("cce sync-worktree", "Refresh a worktree's semantic delta"),
         ]),
         ("Status & Savings", [
             ("cce status", "Index health, config, embedding model, Ollama status"),
@@ -3460,11 +3564,13 @@ async def _run_index(
     full: bool = False,
     target_path: str | None = None,
     verbose: bool = False,
-) -> None:
+    storage_base_override: Path | None = None,
+    progress_lines: bool = False,
+):
     """Run indexing pipeline (thin wrapper over `indexer.pipeline.run_indexing`)."""
     from context_engine.indexer.pipeline import run_indexing
 
-    storage_base = _runtime_storage_base(config, Path(project_dir))
+    storage_base = storage_base_override or _runtime_storage_base(config, Path(project_dir))
     log_fn = (lambda msg: click.echo(msg)) if verbose else None
     from context_engine.cli_style import warn, dim, CHECK, CROSS
 
@@ -3487,6 +3593,8 @@ async def _run_index(
         if not verbose and sys.stdout.isatty():
             _render_bar(current, total, "files")
             _showed_progress = True
+        elif progress_lines:
+            click.echo(f"    {current}/{total} files")
 
     def embed_progress_fn(current: int, total: int) -> None:
         nonlocal _showed_embed_progress, _showed_progress
@@ -3497,6 +3605,8 @@ async def _run_index(
                 click.echo()
             _render_bar(current, total, "chunks embedded")
             _showed_embed_progress = True
+        elif progress_lines:
+            click.echo(f"    {current}/{total} chunks embedded")
 
     def phase_fn(msg: str) -> None:
         """Print a status line between indexing phases.
@@ -3515,12 +3625,32 @@ async def _run_index(
             _showed_embed_progress = False
         click.echo(f"    {_dim(msg)}")
 
-    result = await run_indexing(
-        config, project_dir, full=full, target_path=target_path,
-        storage_base_override=storage_base,
-        log_fn=log_fn, progress_fn=progress_fn,
-        embed_progress_fn=embed_progress_fn, phase_fn=phase_fn,
-    )
+    from context_engine.git import resolve_git_repository_context
+
+    if (
+        storage_base_override is None
+        and target_path is None
+        and resolve_git_repository_context(Path(project_dir)) is not None
+    ):
+        from context_engine.indexer.worktree import sync_worktree_overlay
+
+        result, _, layout = await sync_worktree_overlay(
+            config,
+            project_dir,
+            force=full,
+            log_fn=log_fn,
+            progress_fn=progress_fn,
+            embed_progress_fn=embed_progress_fn,
+            phase_fn=phase_fn,
+        )
+        storage_base = layout.worktree_dir
+    else:
+        result = await run_indexing(
+            config, project_dir, full=full, target_path=target_path,
+            storage_base_override=storage_base,
+            log_fn=log_fn, progress_fn=progress_fn,
+            embed_progress_fn=embed_progress_fn, phase_fn=phase_fn,
+        )
 
     if _showed_progress or _showed_embed_progress:
         click.echo()  # newline after progress bar(s)
@@ -3568,6 +3698,7 @@ async def _run_index(
     stats["full_file_tokens"] = total_tokens
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text(json.dumps(stats), encoding="utf-8")
+    return result
 
 
 def _runtime_storage_base(config, project_dir: Path) -> Path:
@@ -3581,7 +3712,7 @@ def _runtime_storage_base(config, project_dir: Path) -> Path:
         return project_storage_dir(config, project_dir)
 
     layout = repository_storage_layout(config, project_dir, context)
-    return layout.base_dir
+    return layout.worktree_dir
 
 
 def _runtime_storage_backend(config, project_dir: Path):
@@ -3599,25 +3730,23 @@ def _runtime_storage_backend(config, project_dir: Path):
         return storage_base, LocalBackend(base_path=str(storage_base)), None
 
     layout = repository_storage_layout(config, project_dir, context)
-    diff = get_worktree_diff(
-        context.worktree_root,
-        base_sha=context.base_sha,
-        head_sha=context.head_sha,
-    )
+    from context_engine.indexer.worktree import indexed_worktree_diff
+
+    def current_diff():
+        return indexed_worktree_diff(layout, head_sha=context.head_sha) or get_worktree_diff(
+            context.worktree_root,
+            base_sha=context.base_sha,
+            head_sha=context.head_sha,
+        )
+
     backend = WorktreeOverlayBackend(
         base=LocalBackend(base_path=str(layout.base_dir)),
         overlay=LocalBackend(base_path=str(layout.worktree_dir)),
-        diff=diff,
+        diff=current_diff(),
     )
 
     def refresh_diff() -> None:
-        backend.update_diff(
-            get_worktree_diff(
-                context.worktree_root,
-                base_sha=context.base_sha,
-                head_sha=context.head_sha,
-            )
-        )
+        backend.update_diff(current_diff())
 
     return layout.worktree_dir, backend, refresh_diff
 
@@ -3684,17 +3813,12 @@ async def _run_serve(config) -> None:
     )
     import sys
 
-    needs_overlay_index = getattr(backend, "needs_overlay_index", None)
-    if needs_overlay_index is not None and needs_overlay_index():
+    if refresh_diff is not None:
         try:
-            await run_indexing(
-                config,
-                project_dir,
-                full=False,
-                storage_base_override=storage_base,
-            )
-            if refresh_diff is not None:
-                refresh_diff()
+            from context_engine.indexer.worktree import sync_worktree_overlay
+
+            _, diff, _ = await sync_worktree_overlay(config, project_dir)
+            backend.update_diff(diff)
         except Exception as exc:
             _log.warning("Startup worktree overlay indexing failed: %s", exc)
 

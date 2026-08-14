@@ -53,6 +53,24 @@ cce index -v           # Verbose output
 
 The git hooks installed by `cce init` call `cce index` automatically after every commit.
 
+## cce index-base
+
+Build or refresh the shared repository base index used by linked worktrees.
+
+```bash
+cce index-base
+cce index-base --project-dir ../repo-linked-worktree
+```
+
+## cce sync-worktree
+
+Scan a linked worktree and refresh only files that differ from the shared base.
+
+```bash
+cce sync-worktree
+cce sync-worktree --project-dir ../repo-linked-worktree
+```
+
 ## cce status
 
 Show index health and token savings summary.

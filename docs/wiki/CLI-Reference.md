@@ -50,6 +50,8 @@ Shows every available command grouped by category:
     cce index                           Re-index changed files
     cce index --full                    Force full re-index of every file
     cce index --path <file>             Index one file or directory
+    cce index-base                      Build shared base index for worktrees
+    cce sync-worktree                   Refresh a worktree's semantic delta
 
   ── Status & Savings ──────────────────────────────
     cce status                          Index health, config, embedding model, Ollama status

@@ -1783,6 +1783,7 @@ class ContextEngineMCP:
                 self._project_dir,
                 full=False,
                 target_path=path,
+                storage_base_override=getattr(self, "_index_storage_base", None),
             )
         except Exception as exc:
             log.exception("reindex failed")

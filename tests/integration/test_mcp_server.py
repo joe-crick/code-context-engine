@@ -1,9 +1,11 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from context_engine.cli import _run_index, _runtime_storage_backend, _runtime_storage_base
+from context_engine.git.diff import GitWorktreeDiff
 from context_engine.integration.mcp_server import ContextEngineMCP
 from context_engine.models import Chunk, ChunkType
 from context_engine.retrieval.retriever import HybridRetriever
+from context_engine.storage.worktree_overlay import WorktreeOverlayBackend
 from context_engine.structural import (
     ProviderStatus,
     Relationship,
@@ -61,8 +63,62 @@ def _embedded_chunk(chunk_id, file_path, content):
 
 
 class _StubEmbedder:
+    cache_salt = "stub"
+    dimension = 4
+
+    def __init__(self, *args, **kwargs):
+        self.cache = None
+
+    def attach_cache(self, cache):
+        self.cache = cache
+
+    def embed(self, chunks, progress_fn=None):
+        for chunk in chunks:
+            chunk.embedding = [0.1, 0.2, 0.3, 0.4]
+        if progress_fn:
+            progress_fn(len(chunks), len(chunks))
+
     def embed_query(self, query):
         return [0.1, 0.2, 0.3, 0.4]
+
+
+class _MemoryBackend:
+    def __init__(self):
+        self.chunks: list[Chunk] = []
+
+    async def ingest(self, chunks, nodes, edges):
+        self.chunks.extend(chunks)
+
+    async def vector_search(self, query_embedding, top_k=10, filters=None):
+        chunks = self.chunks
+        if filters and "file_path" in filters:
+            chunks = [chunk for chunk in chunks if chunk.file_path == filters["file_path"]]
+        return chunks[:top_k]
+
+    async def fts_search(self, query, top_k=30):
+        query = query.lower()
+        return [
+            (chunk.id, -rank)
+            for rank, chunk in enumerate(self.chunks[:top_k])
+            if query in chunk.content.lower()
+        ]
+
+    async def get_chunks_by_ids(self, chunk_ids):
+        wanted = set(chunk_ids)
+        return [chunk for chunk in self.chunks if chunk.id in wanted]
+
+    async def get_chunk_by_id(self, chunk_id):
+        return next((chunk for chunk in self.chunks if chunk.id == chunk_id), None)
+
+    async def delete_by_file(self, file_path):
+        self.chunks = [chunk for chunk in self.chunks if chunk.file_path != file_path]
+
+    async def delete_by_files(self, file_paths):
+        doomed = set(file_paths)
+        self.chunks = [chunk for chunk in self.chunks if chunk.file_path not in doomed]
+
+    def count_chunks(self):
+        return len(self.chunks)
 
 
 def _symbol(name, path, line=1):
@@ -326,6 +382,95 @@ async def test_run_index_uses_runtime_storage_base_for_git_repositories(tmp_path
     await _run_index(cfg, str(repo))
 
     assert indexing_kwargs[0]["storage_base_override"] == expected_storage
+
+
+@pytest.mark.asyncio
+async def test_mcp_reindex_passes_runtime_storage_override(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    cfg = MagicMock()
+    cfg.storage_path = str(tmp_path / "storage")
+    expected_storage, _, _ = _runtime_storage_backend(cfg, repo)
+    indexing_kwargs: list[dict] = []
+
+    async def fake_run_indexing(*args, **kwargs):
+        from context_engine.indexer.pipeline import IndexResult
+
+        indexing_kwargs.append(kwargs)
+        return IndexResult(indexed_files=["base.py"], total_chunks=1)
+
+    monkeypatch.setattr("context_engine.indexer.pipeline.run_indexing", fake_run_indexing)
+
+    server = _make_server(tmp_path)
+    server._config = cfg
+    server._project_dir = str(repo)
+    server._index_storage_base = expected_storage
+
+    await server._handle_reindex({"path": "base.py"})
+
+    assert indexing_kwargs[0]["storage_base_override"] == expected_storage
+    assert indexing_kwargs[0]["target_path"] == "base.py"
+
+
+@pytest.mark.asyncio
+async def test_mcp_reindexed_worktree_file_is_searchable_via_context_search_backend(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = MagicMock()
+    cfg.storage_path = str(tmp_path / "storage")
+    cfg.output_compression = "off"
+    cfg.compression_level = "off"
+    cfg.retrieval_confidence_threshold = 0.0
+    cfg.retrieval_marginal_ratio = 0.0
+    cfg.structural_provider = "off"
+    storage_base = tmp_path / "storage" / "repos" / "repo-id" / "worktrees" / "worktree-id"
+    backend = WorktreeOverlayBackend(
+        base=_MemoryBackend(),
+        overlay=_MemoryBackend(),
+        diff=GitWorktreeDiff(modified={"base.py"}),
+    )
+
+    async def fake_run_indexing(config, project_dir, *, storage_base_override=None, **kwargs):
+        from context_engine.indexer.pipeline import IndexResult
+
+        assert storage_base_override == storage_base
+        await backend.ingest(
+            [_embedded_chunk(
+                "overlay-reindexed",
+                "base.py",
+                "def base():\n    return 'overlayneedle from worktree reindex'\n",
+            )],
+            [],
+            [],
+        )
+        return IndexResult(indexed_files=["base.py"], total_chunks=1)
+
+    monkeypatch.setattr("context_engine.indexer.pipeline.run_indexing", fake_run_indexing)
+    server = _make_server(tmp_path)
+    server._config = cfg
+    server._project_dir = str(tmp_path / "repo")
+    server._project_name = "repo"
+    server._index_storage_base = storage_base
+    server._backend = backend
+    server._retriever = HybridRetriever(backend=backend, embedder=_StubEmbedder())
+    server._compressor = MagicMock()
+    server._compressor.compress = AsyncMock(side_effect=lambda chunks, _level: chunks)
+    server._session_capture = MagicMock()
+    server._session_capture.touch_files = MagicMock()
+    server._session_capture.get_session_snapshot = MagicMock(return_value={
+        "decisions": [],
+        "code_areas": [],
+        "touched_files": {},
+    })
+    server._persist_current_session = MagicMock()
+    server._record = MagicMock()
+    server._append_audit_log = MagicMock()
+    server._session_id = "test-session"
+
+    await server._handle_reindex({"path": "base.py"})
+    result = await server._handle_context_search({"query": "overlayneedle", "top_k": 5})
+
+    assert "overlayneedle from worktree reindex" in result[0].text
 
 
 def test_apply_output_compression_appends_directive(tmp_path):

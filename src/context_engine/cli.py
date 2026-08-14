@@ -899,8 +899,15 @@ def _init_instruction_targets(editor_targets: set[str]) -> set[str]:
 )
 @click.option("--plugin", "gen_plugin", is_flag=True, help="Generate an Agent Plugin directory")
 @click.option("--plugin-dir", default=None, type=click.Path(), help="Plugin output directory (default: .cce/plugin/)")
+@click.option("--no-index", is_flag=True, help="Set up CCE without running the initial index")
 @click.pass_context
-def init(ctx: click.Context, agent: str, gen_plugin: bool, plugin_dir: str | None) -> None:
+def init(
+    ctx: click.Context,
+    agent: str,
+    gen_plugin: bool,
+    plugin_dir: str | None,
+    no_index: bool,
+) -> None:
     """Initialize context engine and connect it to AI coding agents."""
     from context_engine.indexer.git_hooks import install_hooks
     from context_engine.project_commands import ensure_gitignore
@@ -916,8 +923,9 @@ def init(ctx: click.Context, agent: str, gen_plugin: bool, plugin_dir: str | Non
     click.echo("")
 
     # 1. Pre-flight: verify embedding model + report Ollama status
-    _preflight_check(config)
-    click.echo("")
+    if not no_index:
+        _preflight_check(config)
+        click.echo("")
 
     # 2. Storage
     storage_dir = project_storage_dir(config, project_dir)
@@ -1013,19 +1021,23 @@ def init(ctx: click.Context, agent: str, gen_plugin: bool, plugin_dir: str | Non
     _ok(".gitignore updated with CCE entries")
 
     click.echo("")
-    click.echo(
-        "  " + click.style("Indexing project", fg="cyan", bold=True) + "..."
-    )
-    asyncio.run(_run_index(config, str(project_dir), full=True))
-
-    # Show codebase size + estimated savings so the user sees the payoff
-    _storage = project_storage_dir(config, project_dir)
-    _stats_p = _storage / "stats.json"
-    try:
-        _st = json.loads(_stats_p.read_text(encoding="utf-8")) if _stats_p.exists() else {}
-        _full_tokens = _st.get("full_file_tokens", 0)
-    except (json.JSONDecodeError, OSError):
+    if no_index:
+        _warn("Indexing skipped (--no-index)")
         _full_tokens = 0
+    else:
+        click.echo(
+            "  " + click.style("Indexing project", fg="cyan", bold=True) + "..."
+        )
+        asyncio.run(_run_index(config, str(project_dir), full=True))
+
+        # Show codebase size + estimated savings so the user sees the payoff
+        _storage = project_storage_dir(config, project_dir)
+        _stats_p = _storage / "stats.json"
+        try:
+            _st = json.loads(_stats_p.read_text(encoding="utf-8")) if _stats_p.exists() else {}
+            _full_tokens = _st.get("full_file_tokens", 0)
+        except (json.JSONDecodeError, OSError):
+            _full_tokens = 0
 
     if _full_tokens > 0:
         from context_engine.pricing import resolve_pricing

@@ -4,16 +4,26 @@ from __future__ import annotations
 import json
 import tomllib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from context_engine.cli import _init_editor_targets, main
+from context_engine.config import Config
 from context_engine.editors import _project_slug
 
 
 async def _noop_index(*args, **kwargs):
     return None
+
+
+@pytest.fixture(autouse=True)
+def _writable_storage(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "context_engine.cli.load_config",
+        lambda *args, **kwargs: Config(storage_path=str(tmp_path / "storage")),
+    )
 
 
 def test_init_pi_writes_config_and_agents_md(tmp_path, monkeypatch):
@@ -170,6 +180,60 @@ def test_init_codex_writes_codex_config_and_agents_md(tmp_path, monkeypatch):
     entry = parsed["mcp_servers"][f"cce-{_project_slug(project)}"]
     assert entry["command"] == "/usr/bin/cce"
     assert entry["args"] == ["serve", "--project-dir", str(project)]
+
+
+def test_init_codex_no_index_registers_codex_without_indexing(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    index_mock = AsyncMock()
+    preflight_mock = Mock()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr("context_engine.cli._preflight_check", preflight_mock)
+    monkeypatch.setattr("context_engine.cli._run_index", index_mock)
+    monkeypatch.chdir(project)
+
+    runner = CliRunner()
+    with patch("context_engine.editors.resolve_cce_binary", return_value="/usr/bin/cce"):
+        result = runner.invoke(
+            main,
+            ["init", "--agent", "codex", "--no-index"],
+            catch_exceptions=False,
+            obj={},
+        )
+
+    assert result.exit_code == 0
+    assert "Indexing skipped (--no-index)" in result.output
+    assert (project / "AGENTS.md").exists()
+    codex_config = tomllib.loads((fake_home / ".codex" / "config.toml").read_text())
+    entry = codex_config["mcp_servers"][f"cce-{_project_slug(project)}"]
+    assert entry["command"] == "/usr/bin/cce"
+    assert entry["args"] == ["serve", "--project-dir", str(project)]
+    index_mock.assert_not_called()
+    preflight_mock.assert_not_called()
+
+
+def test_init_codex_indexes_normally(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    index_mock = AsyncMock()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr("context_engine.cli._preflight_check", lambda config: None)
+    monkeypatch.setattr("context_engine.cli._run_index", index_mock)
+    monkeypatch.chdir(project)
+
+    runner = CliRunner()
+    with patch("context_engine.editors.resolve_cce_binary", return_value="/usr/bin/cce"):
+        result = runner.invoke(main, ["init", "--agent", "codex"], catch_exceptions=False, obj={})
+
+    assert result.exit_code == 0
+    index_mock.assert_awaited_once()
+    _, project_dir = index_mock.await_args.args[:2]
+    assert project_dir == str(project)
+    assert index_mock.await_args.kwargs["full"] is True
 
 
 def test_init_claude_does_not_write_other_instruction_files(tmp_path, monkeypatch):
